@@ -1,0 +1,75 @@
+import serial
+import time
+import sys
+
+PORTA = '/dev/ttyUSB0'
+BAUDRATE = 38400
+
+# Constantes do Celta 1.0 VHC Flexpower (X10YFL)
+DISPLACEMENT = 0.999   # 999 cm³[cite: 3]
+VE = 0.80             # Eficiência volumétrica típica em lenta/cruzeiro
+AFR = 9            #13.2 Gasolina Comum E27 (ou 9.0 para Etanol E100)[cite: 1]
+DENSIDADE = 789.0     #740.0 g/L (Gasolina) ou 789.0 (Etanol)[cite: 1]
+
+try:
+    ser = serial.Serial(PORTA, BAUDRATE, timeout=1.0)
+except Exception as e:
+    print(f"Erro serial: {e}")
+    sys.exit(1)
+
+def cmd(c, delay=0.1):
+    ser.flushInput()
+    ser.write((c + '\r\n').encode())
+    time.sleep(delay)
+    raw = ser.read_until(b'>').decode('ascii', errors='ignore')
+    return raw.replace('>', ' ').replace('\r', ' ').replace('\n', ' ').strip()
+
+print("[*] Conectando a central Multec H...")
+cmd("ATZ", 0.5)
+cmd("ATE0")
+cmd("ATL0")
+cmd("ATSP5")
+cmd("ATSH 81 11 F1")
+cmd("ATFI", 0.5)
+print("[+] Telemetria ativa!\n")
+
+try:
+    while True:
+        resp = cmd("21 01", 0.06)
+        tokens = resp.split()
+
+        for i in range(len(tokens) - 1):
+            if tokens[i] == '61' and tokens[i+1] == '01':
+                raw_hex = [b for b in tokens[i+2:] if len(b) == 2 and all(c in '0123456789ABCDEFabcdef' for c in b)]
+                
+                if len(raw_hex) >= 82:
+                    b = [int(x, 16) for x in raw_hex]
+
+                    # Extracao dos parametros validados
+                    tensao_bat = b[31] * 0.1
+                    rpm = ((b[32] << 8) | b[33]) / 4.0
+                    temp_ect = b[38] - 40
+                    temp_iat = b[40] - 40
+                    tps = (b[60] * 100.0) / 255.0
+                    map_kpa = float(b[80])
+
+                    # Calculo de fluxo Speed-Density
+                    t_kelvin = temp_iat + 273.15
+                    # Vazao de ar em g/s
+                    maf_gps = (rpm * map_kpa * DISPLACEMENT * VE) / (120.0 * 287.05 * t_kelvin) * 1000.0
+                    
+                    # Consumo em L/h
+                    consumo_lh = (maf_gps * 3600.0) / (AFR * DENSIDADE) if rpm > 350 else 0.0
+
+                    sys.stdout.write(
+                        f"\rRPM: {int(rpm):4d} | MAP: {int(map_kpa):2d} kPa | TPS: {tps:4.1f}% | "
+                        f"ECT: {temp_ect:2d}°C | IAT: {temp_iat:2d}°C | Bat: {tensao_bat:4.1f}V | "
+                        f"Consumo: {consumo_lh:4.2f} L/h  "
+                    )
+                    sys.stdout.flush()
+                break
+        time.sleep(0.04)
+
+except KeyboardInterrupt:
+    print("\nEncerrado.")
+    ser.close()
